@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { getCalendarClient, listCalendars, listEvents, createEvent } from "./calendar.js";
+import { getCalendarClient, listCalendars, listEvents, listAcl, createEvent } from "./calendar.js";
 
 const secret = () => process.env.TOKEN_ENCRYPTION_KEY!;
 const clientId = () => process.env.GOOGLE_CLIENT_ID!;
@@ -56,6 +56,21 @@ export function registerTools(server: McpServer): void {
         args.maxResults,
         args.q
       );
+      return { content: [{ type: "text" as const, text: JSON.stringify({ items }, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    "list_acl",
+    "List access control rules for a calendar (who has access and their role)",
+    {
+      calendarId: z.string().describe("Calendar ID (e.g. primary)"),
+    },
+    async (args, extra) => {
+      const userId = extra?.sessionId ? getUserIdForSession(extra.sessionId) : undefined;
+      if (!userId) throw new Error("Not authenticated");
+      const client = await getCalendarClient(userId, secret(), clientId(), clientSecret());
+      const items = await listAcl(client, args.calendarId);
       return { content: [{ type: "text" as const, text: JSON.stringify({ items }, null, 2) }] };
     }
   );

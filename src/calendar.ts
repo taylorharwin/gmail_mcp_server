@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { google } from "googleapis";
 import { loadTokens, saveTokens, type StoredTokens } from "./storage.js";
 
-const SCOPES = ["https://www.googleapis.com/auth/calendar.events", "https://www.googleapis.com/auth/calendar.readonly"];
+const SCOPES = ["https://www.googleapis.com/auth/calendar"];
 
 export function getAuthUrl(clientId: string, redirectUri: string, state: string, codeVerifier: string): string {
   const oauth2 = new google.auth.OAuth2(clientId, undefined, redirectUri);
@@ -100,6 +100,21 @@ export async function listEvents(
     end: (e.end?.dateTime ?? e.end?.date) ?? "",
     status: e.status ?? "confirmed",
     htmlLink: e.htmlLink ?? "",
+  }));
+}
+
+export async function listAcl(
+  client: Awaited<ReturnType<typeof getCalendarClient>>,
+  calendarId: string
+): Promise<{ id: string; scope: { type: string; value: string }; role: string }[]> {
+  const res = await client.acl.list({ calendarId });
+  return (res.data.items ?? []).map((rule) => ({
+    id: rule.id!,
+    scope: {
+      type: rule.scope?.type ?? "unknown",
+      value: rule.scope?.value ?? "",
+    },
+    role: rule.role ?? "none",
   }));
 }
 
