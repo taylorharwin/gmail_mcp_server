@@ -14,7 +14,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { createPendingAuth, handleCallback, authMiddleware } from "./auth.js";
 import { registerTools, setSessionUser, clearSession } from "./tools.js";
 
-const PORT = Number(process.env.PORT) || 3001;
+const PORT = Number(process.env.PORT) || 3000;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 process.on("uncaughtException", (err) => {
@@ -89,19 +89,15 @@ app.get("/callback", async (req, res) => {
     const { sessionToken } = await handleCallback(code, state, clientSecret, secret);
     const tokenPath = process.env.MCP_TOKEN_FILE || join(__dirname, "..", ".mcp-token");
     writeFileSync(tokenPath, sessionToken, "utf8");
-    res.redirect(302, `${BASE_URL}/auth/success?token=${encodeURIComponent(sessionToken)}`);
+    res.set("Content-Type", "text/html").send(
+      htmlPage("Signed in",
+        "<p>Use this token in your MCP client (Bearer):</p>" +
+        "<pre style=\"background:#fff;padding:1rem;overflow:auto\">" + escapeHtml(sessionToken) + "</pre>" +
+        "<p>Token saved to <code>" + escapeHtml(tokenPath) + "</code></p>")
+    );
   } catch (e) {
     res.status(400).send("Auth failed: " + (e instanceof Error ? e.message : String(e)));
   }
-});
-
-app.get("/auth/success", (req, res) => {
-  const token = (req.query.token as string) ?? "";
-  const tokenPath = process.env.MCP_TOKEN_FILE || join(__dirname, "..", ".mcp-token");
-  const savedNote = token ? "<p>Token also saved to <code>" + escapeHtml(tokenPath) + "</code></p>" : "";
-  res.set("Content-Type", "text/html").send(
-    htmlPage("Signed in", "<p>Use this token in your MCP client (Bearer):</p><pre style=\"background:#fff;padding:1rem;overflow:auto\">" + escapeHtml(token) + "</pre>" + savedNote + (token ? "" : "<p style=\"color:red\">No token received. Try signing in again from <a href=\"/authorize\">/authorize</a>.</p>"))
-  );
 });
 
 app.post("/mcp", authMiddleware, async (req, res) => {

@@ -20,15 +20,21 @@ export function clearSession(sessionId: string): void {
   sessionToUserId.delete(sessionId);
 }
 
+type CalendarClient = Awaited<ReturnType<typeof getCalendarClient>>;
+
+async function calendarFor(extra: { sessionId?: string }): Promise<CalendarClient> {
+  const userId = extra?.sessionId ? getUserIdForSession(extra.sessionId) : undefined;
+  if (!userId) throw new Error("Not authenticated");
+  return getCalendarClient(userId, secret(), clientId(), clientSecret());
+}
+
 export function registerTools(server: McpServer): void {
   server.tool(
     "list_calendars",
     "List calendars the user can access",
     { minAccessRole: z.string().optional().describe("Optional filter by min access role") },
     async (args, extra) => {
-      const userId = extra?.sessionId ? getUserIdForSession(extra.sessionId) : undefined;
-      if (!userId) throw new Error("Not authenticated");
-      const client = await getCalendarClient(userId, secret(), clientId(), clientSecret());
+      const client = await calendarFor(extra);
       const items = await listCalendars(client, args.minAccessRole);
       return { content: [{ type: "text" as const, text: JSON.stringify({ items }, null, 2) }] };
     }
@@ -45,17 +51,8 @@ export function registerTools(server: McpServer): void {
       q: z.string().optional(),
     },
     async (args, extra) => {
-      const userId = extra?.sessionId ? getUserIdForSession(extra.sessionId) : undefined;
-      if (!userId) throw new Error("Not authenticated");
-      const client = await getCalendarClient(userId, secret(), clientId(), clientSecret());
-      const items = await listEvents(
-        client,
-        args.calendarId,
-        args.timeMin,
-        args.timeMax,
-        args.maxResults,
-        args.q
-      );
+      const client = await calendarFor(extra);
+      const items = await listEvents(client, args.calendarId, args.timeMin, args.timeMax, args.maxResults, args.q);
       return { content: [{ type: "text" as const, text: JSON.stringify({ items }, null, 2) }] };
     }
   );
@@ -67,9 +64,7 @@ export function registerTools(server: McpServer): void {
       calendarId: z.string().describe("Calendar ID (e.g. primary)"),
     },
     async (args, extra) => {
-      const userId = extra?.sessionId ? getUserIdForSession(extra.sessionId) : undefined;
-      if (!userId) throw new Error("Not authenticated");
-      const client = await getCalendarClient(userId, secret(), clientId(), clientSecret());
+      const client = await calendarFor(extra);
       const items = await listAcl(client, args.calendarId);
       return { content: [{ type: "text" as const, text: JSON.stringify({ items }, null, 2) }] };
     }
@@ -87,17 +82,9 @@ export function registerTools(server: McpServer): void {
       attendees: z.array(z.string()).optional(),
     },
     async (args, extra) => {
-      const userId = extra?.sessionId ? getUserIdForSession(extra.sessionId) : undefined;
-      if (!userId) throw new Error("Not authenticated");
-      const client = await getCalendarClient(userId, secret(), clientId(), clientSecret());
+      const client = await calendarFor(extra);
       const event = await createEvent(
-        client,
-        args.calendarId,
-        args.summary,
-        args.start,
-        args.end,
-        args.description,
-        args.attendees
+        client, args.calendarId, args.summary, args.start, args.end, args.description, args.attendees
       );
       return { content: [{ type: "text" as const, text: JSON.stringify(event, null, 2) }] };
     }
