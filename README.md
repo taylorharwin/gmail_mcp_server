@@ -2,7 +2,7 @@
 
 Remote MCP server for Google Calendar (Streamable HTTP + OAuth 2.1 with PKCE). Tools: `list_calendars`, `list_events`, `list_acl`, `create_event`.
 
-## Quick Start (5 min)
+## Quick Start
 
 1. **Google Cloud**: Create a project, enable [Calendar API](https://console.cloud.google.com/apis/library/calendar-json.googleapis.com), configure OAuth consent screen, create OAuth 2.0 Client ID (Web app). Add redirect URI: `http://localhost:3000/callback`.
 
@@ -17,11 +17,54 @@ Remote MCP server for Google Calendar (Streamable HTTP + OAuth 2.1 with PKCE). T
    npm install && npm start
    ```
 
-4. **Sign in**: Open `http://localhost:3000/authorize` in a browser; after Google consent you'll get a session token. Use it as Bearer token for MCP requests.
+4. **Connect**: Point an MCP client (Claude Desktop, Cursor, etc.) at `http://localhost:3000/mcp`. The client will discover the OAuth flow automatically via the well-known metadata endpoints.
 
-## OAuth scope
+## OAuth flow (MCP-spec compliant)
 
-- `https://www.googleapis.com/auth/calendar` — full read/write access to calendars, events, and ACL. Required by the `list_acl` tool; also covers `list_calendars`, `list_events`, and `create_event`.
+The server acts as both an OAuth 2.1 Authorization Server and a Resource Server, wrapping Google OAuth underneath. The flow follows the [MCP authorization spec (2025-11-25)](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization).
+
+```
+MCP Client → POST /mcp (no token)
+         ← 401 + WWW-Authenticate with resource_metadata URL
+
+MCP Client → GET /.well-known/oauth-protected-resource
+         ← { resource, authorization_servers: [BASE_URL] }
+
+MCP Client → GET /.well-known/oauth-authorization-server
+         ← { issuer, authorization_endpoint, token_endpoint, ... }
+
+MCP Client → (browser) GET /authorize?response_type=code&client_id=...&redirect_uri=...&code_challenge=...&state=...
+         → server redirects to Google OAuth consent
+         → Google redirects back to /callback
+         → server redirects to MCP client's redirect_uri with ?code=...&state=...
+
+MCP Client → POST /token (grant_type=authorization_code, code, code_verifier, redirect_uri, client_id)
+         ← { access_token, token_type: "Bearer", expires_in, refresh_token }
+
+MCP Client → POST /mcp with Authorization: Bearer <access_token>
+         ← Calendar data
+```
+
+### Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/.well-known/oauth-protected-resource` | GET | RFC 9728 protected resource metadata |
+| `/.well-known/oauth-authorization-server` | GET | RFC 8414 authorization server metadata |
+| `/authorize` | GET | OAuth authorization endpoint (redirects to Google) |
+| `/callback` | GET | Google OAuth redirect URI (redirects to MCP client) |
+| `/token` | POST | OAuth token endpoint (authorization_code, refresh_token) |
+| `/mcp` | POST/GET/DELETE | MCP transport (protected, requires Bearer token) |
+
+### Token lifecycle
+
+- **Authorization codes**: 10 min TTL, single-use. Replay triggers revocation of all associated tokens.
+- **Access tokens**: configurable via `ACCESS_TOKEN_TTL_SECONDS` (default 3600 = 1 hour).
+- **Refresh tokens**: long-lived. Use `grant_type=refresh_token` at `/token` to get a new access token.
+
+## Google OAuth scope
+
+- `https://www.googleapis.com/auth/calendar` — full read/write access to calendars, events, and ACL.
 
 ## Tools (JSON Schema summary)
 
@@ -32,21 +75,6 @@ Remote MCP server for Google Calendar (Streamable HTTP + OAuth 2.1 with PKCE). T
 | `list_acl` | `calendarId` | `{ items: { id, scope: { type, value }, role }[] }` |
 | `create_event` | `calendarId`, `summary`, `start`, `end` (ISO), `description?`, `attendees?` (string[]) | `{ id, htmlLink, start, end }` |
 
-## Client config (Cursor / Claude)
-
-Point the MCP client at your server URL. Auth: use the token from the sign-in page as Bearer for the session.
-
-Example (after you have a token):
-
-```bash
-# POST /mcp with session from GET (initialize first to get session id)
-curl -X POST http://localhost:3000/mcp \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -H "mcp-session-id: YOUR_SESSION_ID" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_calendars","arguments":{}}}'
-```
-
 ## Examples
 
 1. **list_calendars** — `arguments: {}` or `{ "minAccessRole": "writer" }`.
@@ -54,16 +82,67 @@ curl -X POST http://localhost:3000/mcp \
 3. **list_acl** — `arguments: { "calendarId": "primary" }`.
 4. **create_event** — `arguments: { "calendarId": "primary", "summary": "Meeting", "start": "2025-02-15T14:00:00Z", "end": "2025-02-15T15:00:00Z" }`.
 
-## Trade-offs
+## Adding a `delete_event` tool
 
-- Phase 1: four tools only; more (get/update/delete event, freebusy) can be added later.
-- Tokens stored encrypted (memory + optional file via `TOKEN_STORE_PATH`). Sessions in memory.
-- No dynamic client registration or full RFC 8414 metadata; single user per server instance for simplicity.
+### 1. Add the Google Calendar API call in `src/calendar.ts`
+
+```ts
+export async function deleteEvent(
+  client: Awaited<ReturnType<typeof getCalendarClient>>,
+  calendarId: string,
+  eventId: string
+): Promise<void> {
+  await client.events.delete({ calendarId, eventId });
+}
+```
+
+### 2. Register the tool in `src/tools.ts`
+
+Import `deleteEvent` from `./calendar.js`, then add inside `registerTools()`:
+
+```ts
+server.registerTool(
+  "delete_event",
+  {
+    description: "Delete a calendar event",
+    inputSchema: {
+      calendarId: z.string().describe("Calendar ID (e.g. primary)"),
+      eventId: z.string().describe("Event ID to delete"),
+    },
+    outputSchema: {
+      deleted: z.boolean(),
+    },
+  },
+  async (args, extra) => {
+    const client = await calendarFor(extra);
+    await deleteEvent(client, args.calendarId, args.eventId);
+    return { content: [], structuredContent: { deleted: true } };
+  }
+);
+```
+
+### 3. Update the tools table above
+
+Add a row for `delete_event` to the **Tools** table in this README.
+
+### 4. Test it
+
+```bash
+npm run dev
+# Call via MCP:
+# arguments: { "calendarId": "primary", "eventId": "EVENT_ID_HERE" }
+```
+
+You can get event IDs from the `list_events` tool output.
 
 ## Security
 
-- PKCE (S256) for Google OAuth; tokens encrypted at rest (AES-256-GCM); no tokens in logs or URLs.
-- Validate `Origin` in production; use HTTPS for `BASE_URL` in production.
+- MCP-spec compliant OAuth 2.1 with PKCE (S256) — server acts as its own Authorization Server wrapping Google OAuth
+- Protected Resource Metadata (RFC 9728) and Authorization Server Metadata (RFC 8414)
+- Google tokens encrypted at rest (AES-256-GCM with scrypt-derived keys)
+- Authorization codes are single-use with replay detection and token revocation
+- No tokens in logs or URLs; Bearer tokens in Authorization header only
+- Use HTTPS for `BASE_URL` in production
 
 ## Stack (open source)
 
