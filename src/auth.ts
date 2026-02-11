@@ -1,5 +1,9 @@
-import { createHash, randomBytes } from "node:crypto";
-import type { Request, Response } from "express";
+import { randomBytes } from "node:crypto";
+import type { Response } from "express";
+import type { OAuthServerProvider, AuthorizationParams } from "@modelcontextprotocol/sdk/server/auth/provider.js";
+import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import type { OAuthClientInformationFull, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { getAuthUrl, exchangeCode } from "./calendar.js";
 import { saveTokens } from "./storage.js";
 
@@ -29,7 +33,6 @@ interface PendingAuthorization {
   mcpClientId: string;
   mcpRedirectUri: string;
   mcpCodeChallenge: string;
-  mcpCodeChallengeMethod: string;
   mcpState: string;
   mcpScope: string;
   googleState: string;
@@ -42,7 +45,6 @@ interface IssuedAuthCode {
   mcpClientId: string;
   mcpRedirectUri: string;
   mcpCodeChallenge: string;
-  mcpCodeChallengeMethod: string;
   userId: string;
   createdAt: number;
   used: boolean;
@@ -61,25 +63,6 @@ interface IssuedRefreshToken {
   mcpClientId: string;
 }
 
-interface RegisteredClient {
-  client_id: string;
-  client_name: string;
-  redirect_uris: string[];
-  grant_types: string[];
-  response_types: string[];
-  token_endpoint_auth_method: string;
-}
-
-// ---------------------------------------------------------------------------
-// In-memory stores
-// ---------------------------------------------------------------------------
-
-const registeredClients = new Map<string, RegisteredClient>();
-const pendingAuthorizations = new Map<string, PendingAuthorization>();
-const authCodes = new Map<string, IssuedAuthCode>();
-const accessTokens = new Map<string, IssuedAccessToken>();
-const refreshTokens = new Map<string, IssuedRefreshToken>();
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -92,263 +75,250 @@ function generateToken(): string {
   return b64url(randomBytes(TOKEN_BYTES));
 }
 
-function verifyS256(codeVerifier: string, codeChallenge: string): boolean {
-  const computed = createHash("sha256").update(codeVerifier).digest("base64url");
-  return computed === codeChallenge;
-}
-
-function cleanupExpired(): void {
-  const now = Date.now();
-  for (const [key, val] of pendingAuthorizations) {
-    if (now - val.createdAt > PENDING_AUTH_TTL) pendingAuthorizations.delete(key);
-  }
-  for (const [key, val] of accessTokens) {
-    if (now > val.expiresAt) accessTokens.delete(key);
-  }
-  // Auth codes are not cleaned here — expiry is checked explicitly in exchangeAuthCode
-  // so that the caller gets a specific "expired" error rather than "invalid".
-}
-
-function revokeTokensForUser(userId: string, mcpClientId: string): void {
-  for (const [key, val] of accessTokens) {
-    if (val.userId === userId && val.mcpClientId === mcpClientId) accessTokens.delete(key);
-  }
-  for (const [key, val] of refreshTokens) {
-    if (val.userId === userId && val.mcpClientId === mcpClientId) refreshTokens.delete(key);
-  }
-}
-
 // ---------------------------------------------------------------------------
-// Dynamic Client Registration (RFC 7591)
+// OAuth Server Provider
 // ---------------------------------------------------------------------------
 
-export function registerClient(params: {
-  clientName: string;
-  redirectUris: string[];
-  grantTypes?: string[];
-  responseTypes?: string[];
-  tokenEndpointAuthMethod?: string;
-}): RegisteredClient {
-  const clientId = generateToken();
-  const client: RegisteredClient = {
-    client_id: clientId,
-    client_name: params.clientName,
-    redirect_uris: params.redirectUris,
-    grant_types: params.grantTypes ?? ["authorization_code"],
-    response_types: params.responseTypes ?? ["code"],
-    token_endpoint_auth_method: params.tokenEndpointAuthMethod ?? "none",
-  };
-  registeredClients.set(clientId, client);
-  return client;
-}
+export class GoogleCalendarOAuthProvider implements OAuthServerProvider {
+  private readonly _clients = new Map<string, OAuthClientInformationFull>();
+  private readonly _pendingAuths = new Map<string, PendingAuthorization>();
+  private readonly _authCodes = new Map<string, IssuedAuthCode>();
+  private readonly _accessTokens = new Map<string, IssuedAccessToken>();
+  private readonly _refreshTokens = new Map<string, IssuedRefreshToken>();
 
-// ---------------------------------------------------------------------------
-// OAuth Authorization Server functions
-// ---------------------------------------------------------------------------
-
-export function startAuthorization(params: {
-  clientId: string;
-  redirectUri: string;
-  codeChallenge: string;
-  codeChallengeMethod: string;
-  state: string;
-  scope: string;
-}): { googleAuthUrl: string } {
-  cleanupExpired();
-
-  if (params.codeChallengeMethod !== "S256") {
-    throw new Error("Only code_challenge_method=S256 is supported");
+  get clientsStore(): OAuthRegisteredClientsStore {
+    const clients = this._clients;
+    return {
+      getClient: (clientId: string) => clients.get(clientId),
+      registerClient: (client: Omit<OAuthClientInformationFull, "client_id" | "client_id_issued_at">) => {
+        const clientId = generateToken();
+        const full = {
+          ...client,
+          client_id: clientId,
+          client_id_issued_at: Math.floor(Date.now() / 1000),
+        } as OAuthClientInformationFull;
+        clients.set(clientId, full);
+        return full;
+      },
+    };
   }
 
-  const googleState = generateToken();
-  const googleCodeVerifier = b64url(randomBytes(32));
+  // --- Authorization (redirect to Google) ---
 
-  pendingAuthorizations.set(googleState, {
-    mcpClientId: params.clientId,
-    mcpRedirectUri: params.redirectUri,
-    mcpCodeChallenge: params.codeChallenge,
-    mcpCodeChallengeMethod: params.codeChallengeMethod,
-    mcpState: params.state,
-    mcpScope: params.scope,
-    googleState,
-    googleCodeVerifier,
-    createdAt: Date.now(),
-  });
+  async authorize(
+    client: OAuthClientInformationFull,
+    params: AuthorizationParams,
+    res: Response,
+  ): Promise<void> {
+    this._cleanupExpired();
 
-  const baseUrl = process.env.BASE_URL || "http://localhost:3000";
-  const clientId = process.env.GOOGLE_CLIENT_ID!;
-  const googleAuthUrl = getAuthUrl(clientId, `${baseUrl}/callback`, googleState, googleCodeVerifier);
-  return { googleAuthUrl };
-}
+    const googleState = generateToken();
+    const googleCodeVerifier = b64url(randomBytes(32));
 
-export async function handleOAuthCallback(
-  googleCode: string,
-  googleState: string,
-  clientSecret: string,
-  secret: string
-): Promise<{ redirectUrl: string }> {
-  const pending = pendingAuthorizations.get(googleState);
-  pendingAuthorizations.delete(googleState);
+    this._pendingAuths.set(googleState, {
+      mcpClientId: client.client_id,
+      mcpRedirectUri: params.redirectUri,
+      mcpCodeChallenge: params.codeChallenge,
+      mcpState: params.state ?? "",
+      mcpScope: params.scopes?.join(" ") ?? "google-calendar",
+      googleState,
+      googleCodeVerifier,
+      createdAt: Date.now(),
+    });
 
-  if (!pending) throw new Error("Invalid or expired state");
-  if (Date.now() - pending.createdAt > PENDING_AUTH_TTL) throw new Error("Authorization request expired");
-
-  const baseUrl = process.env.BASE_URL || "http://localhost:3000";
-  const clientId = process.env.GOOGLE_CLIENT_ID!;
-  const tokens = await exchangeCode(clientId, clientSecret, `${baseUrl}/callback`, googleCode, pending.googleCodeVerifier);
-
-  const userId = generateToken();
-  saveTokens(userId, tokens, secret);
-
-  const code = generateToken();
-  authCodes.set(code, {
-    code,
-    mcpClientId: pending.mcpClientId,
-    mcpRedirectUri: pending.mcpRedirectUri,
-    mcpCodeChallenge: pending.mcpCodeChallenge,
-    mcpCodeChallengeMethod: pending.mcpCodeChallengeMethod,
-    userId,
-    createdAt: Date.now(),
-    used: false,
-  });
-
-  const redirectUrl = new URL(pending.mcpRedirectUri);
-  redirectUrl.searchParams.set("code", code);
-  redirectUrl.searchParams.set("state", pending.mcpState);
-  return { redirectUrl: redirectUrl.toString() };
-}
-
-export function exchangeAuthCode(params: {
-  code: string;
-  codeVerifier: string;
-  redirectUri: string;
-  clientId: string;
-}): { access_token: string; token_type: string; expires_in: number; refresh_token: string } {
-  cleanupExpired();
-
-  const entry = authCodes.get(params.code);
-  if (!entry) throw new Error("Invalid authorization code");
-
-  if (entry.used) {
-    revokeTokensForUser(entry.userId, entry.mcpClientId);
-    authCodes.delete(params.code);
-    throw new Error("Authorization code already used");
-  }
-
-  entry.used = true;
-
-  if (Date.now() - entry.createdAt > AUTH_CODE_TTL) {
-    authCodes.delete(params.code);
-    throw new Error("Authorization code expired");
-  }
-
-  if (params.clientId !== entry.mcpClientId) {
-    throw new Error("client_id mismatch");
-  }
-
-  if (params.redirectUri !== entry.mcpRedirectUri) {
-    throw new Error("redirect_uri mismatch");
-  }
-
-  if (!verifyS256(params.codeVerifier, entry.mcpCodeChallenge)) {
-    throw new Error("PKCE verification failed");
-  }
-
-  authCodes.delete(params.code);
-
-  const accessToken = generateToken();
-  const refreshToken = generateToken();
-
-  accessTokens.set(accessToken, {
-    token: accessToken,
-    userId: entry.userId,
-    mcpClientId: entry.mcpClientId,
-    expiresAt: Date.now() + accessTokenTtl(),
-  });
-
-  refreshTokens.set(refreshToken, {
-    token: refreshToken,
-    userId: entry.userId,
-    mcpClientId: entry.mcpClientId,
-  });
-
-  return {
-    access_token: accessToken,
-    token_type: "Bearer",
-    expires_in: accessTokenTtlSeconds(),
-    refresh_token: refreshToken,
-  };
-}
-
-export function refreshAccessToken(params: {
-  refreshToken: string;
-  clientId: string;
-}): { access_token: string; token_type: string; expires_in: number } {
-  const entry = refreshTokens.get(params.refreshToken);
-  if (!entry) throw new Error("Invalid refresh token");
-
-  if (params.clientId !== entry.mcpClientId) {
-    throw new Error("client_id mismatch");
-  }
-
-  const accessToken = generateToken();
-  accessTokens.set(accessToken, {
-    token: accessToken,
-    userId: entry.userId,
-    mcpClientId: entry.mcpClientId,
-    expiresAt: Date.now() + accessTokenTtl(),
-  });
-
-  return {
-    access_token: accessToken,
-    token_type: "Bearer",
-    expires_in: accessTokenTtlSeconds(),
-  };
-}
-
-export function resolveAccessToken(token: string): string | null {
-  const entry = accessTokens.get(token);
-  if (!entry) return null;
-  if (Date.now() > entry.expiresAt) {
-    accessTokens.delete(token);
-    return null;
-  }
-  return entry.userId;
-}
-
-// ---------------------------------------------------------------------------
-// Express middleware
-// ---------------------------------------------------------------------------
-
-export function authMiddleware(req: Request, res: Response, next: () => void): void {
-  const auth = req.headers.authorization;
-  const token = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
-  const userId = token ? resolveAccessToken(token) : null;
-  if (!userId) {
     const baseUrl = process.env.BASE_URL || "http://localhost:3000";
-    res.status(401)
-      .set("WWW-Authenticate", `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`)
-      .json({
-        jsonrpc: "2.0",
-        error: { code: -32001, message: "Unauthorized" },
-        id: null,
-      });
-    return;
+    const googleClientId = process.env.GOOGLE_CLIENT_ID!;
+    const googleAuthUrl = getAuthUrl(googleClientId, `${baseUrl}/callback`, googleState, googleCodeVerifier);
+    res.redirect(302, googleAuthUrl);
   }
-  (req as Request & { userId: string }).userId = userId;
-  next();
+
+  // --- Google callback (not part of OAuthServerProvider interface) ---
+
+  async handleGoogleCallback(googleCode: string, googleState: string): Promise<string> {
+    const pending = this._pendingAuths.get(googleState);
+    this._pendingAuths.delete(googleState);
+
+    if (!pending) throw new Error("Invalid or expired state");
+    if (Date.now() - pending.createdAt > PENDING_AUTH_TTL) throw new Error("Authorization request expired");
+
+    const baseUrl = process.env.BASE_URL || "http://localhost:3000";
+    const googleClientId = process.env.GOOGLE_CLIENT_ID!;
+    const clientSecret = process.env.GOOGLE_CLIENT_SECRET!;
+    const secret = process.env.TOKEN_ENCRYPTION_KEY!;
+
+    const tokens = await exchangeCode(googleClientId, clientSecret, `${baseUrl}/callback`, googleCode, pending.googleCodeVerifier);
+    const userId = generateToken();
+    saveTokens(userId, tokens, secret);
+
+    const code = generateToken();
+    this._authCodes.set(code, {
+      code,
+      mcpClientId: pending.mcpClientId,
+      mcpRedirectUri: pending.mcpRedirectUri,
+      mcpCodeChallenge: pending.mcpCodeChallenge,
+      userId,
+      createdAt: Date.now(),
+      used: false,
+    });
+
+    const redirectUrl = new URL(pending.mcpRedirectUri);
+    redirectUrl.searchParams.set("code", code);
+    redirectUrl.searchParams.set("state", pending.mcpState);
+    return redirectUrl.toString();
+  }
+
+  // --- PKCE challenge lookup (SDK uses this for validation) ---
+
+  async challengeForAuthorizationCode(
+    _client: OAuthClientInformationFull,
+    authorizationCode: string,
+  ): Promise<string> {
+    const entry = this._authCodes.get(authorizationCode);
+    if (!entry) throw new Error("Invalid authorization code");
+    return entry.mcpCodeChallenge;
+  }
+
+  // --- Token exchange ---
+
+  async exchangeAuthorizationCode(
+    client: OAuthClientInformationFull,
+    authorizationCode: string,
+    _codeVerifier?: string,
+    redirectUri?: string,
+    _resource?: URL,
+  ): Promise<OAuthTokens> {
+    this._cleanupExpired();
+
+    const entry = this._authCodes.get(authorizationCode);
+    if (!entry) throw new Error("Invalid authorization code");
+
+    if (entry.used) {
+      this._revokeTokensForUser(entry.userId, entry.mcpClientId);
+      this._authCodes.delete(authorizationCode);
+      throw new Error("Authorization code already used");
+    }
+
+    entry.used = true;
+
+    if (Date.now() - entry.createdAt > AUTH_CODE_TTL) {
+      this._authCodes.delete(authorizationCode);
+      throw new Error("Authorization code expired");
+    }
+
+    if (client.client_id !== entry.mcpClientId) {
+      throw new Error("client_id mismatch");
+    }
+
+    if (redirectUri && redirectUri !== entry.mcpRedirectUri) {
+      throw new Error("redirect_uri mismatch");
+    }
+
+    this._authCodes.delete(authorizationCode);
+
+    const accessToken = generateToken();
+    const refreshToken = generateToken();
+
+    this._accessTokens.set(accessToken, {
+      token: accessToken,
+      userId: entry.userId,
+      mcpClientId: entry.mcpClientId,
+      expiresAt: Date.now() + accessTokenTtl(),
+    });
+
+    this._refreshTokens.set(refreshToken, {
+      token: refreshToken,
+      userId: entry.userId,
+      mcpClientId: entry.mcpClientId,
+    });
+
+    return {
+      access_token: accessToken,
+      token_type: "Bearer",
+      expires_in: accessTokenTtlSeconds(),
+      refresh_token: refreshToken,
+    };
+  }
+
+  async exchangeRefreshToken(
+    client: OAuthClientInformationFull,
+    refreshToken: string,
+    _scopes?: string[],
+    _resource?: URL,
+  ): Promise<OAuthTokens> {
+    const entry = this._refreshTokens.get(refreshToken);
+    if (!entry) throw new Error("Invalid refresh token");
+
+    if (client.client_id !== entry.mcpClientId) {
+      throw new Error("client_id mismatch");
+    }
+
+    const accessToken = generateToken();
+    this._accessTokens.set(accessToken, {
+      token: accessToken,
+      userId: entry.userId,
+      mcpClientId: entry.mcpClientId,
+      expiresAt: Date.now() + accessTokenTtl(),
+    });
+
+    return {
+      access_token: accessToken,
+      token_type: "Bearer",
+      expires_in: accessTokenTtlSeconds(),
+    };
+  }
+
+  // --- Token verification ---
+
+  async verifyAccessToken(token: string): Promise<AuthInfo> {
+    const entry = this._accessTokens.get(token);
+    if (!entry) throw new Error("Invalid access token");
+
+    if (Date.now() > entry.expiresAt) {
+      this._accessTokens.delete(token);
+      throw new Error("Access token expired");
+    }
+
+    return {
+      token,
+      clientId: entry.mcpClientId,
+      scopes: [],
+      expiresAt: Math.floor(entry.expiresAt / 1000),
+      extra: { userId: entry.userId },
+    };
+  }
+
+  // --- Internal helpers ---
+
+  private _cleanupExpired(): void {
+    const now = Date.now();
+    for (const [key, val] of this._pendingAuths) {
+      if (now - val.createdAt > PENDING_AUTH_TTL) this._pendingAuths.delete(key);
+    }
+    for (const [key, val] of this._accessTokens) {
+      if (now > val.expiresAt) this._accessTokens.delete(key);
+    }
+  }
+
+  private _revokeTokensForUser(userId: string, mcpClientId: string): void {
+    for (const [key, val] of this._accessTokens) {
+      if (val.userId === userId && val.mcpClientId === mcpClientId) this._accessTokens.delete(key);
+    }
+    for (const [key, val] of this._refreshTokens) {
+      if (val.userId === userId && val.mcpClientId === mcpClientId) this._refreshTokens.delete(key);
+    }
+  }
+
+  // --- Test helpers ---
+
+  get _testHelpers() {
+    return {
+      pendingAuths: this._pendingAuths,
+      authCodes: this._authCodes,
+      accessTokens: this._accessTokens,
+      refreshTokens: this._refreshTokens,
+    };
+  }
 }
 
-// ---------------------------------------------------------------------------
-// Test helpers (exported for unit tests only)
-// ---------------------------------------------------------------------------
-
-export const _testHelpers = {
-  registeredClients,
-  pendingAuthorizations,
-  authCodes,
-  accessTokens,
-  refreshTokens,
-  verifyS256,
-  generateToken,
-};
+// Exported for tests
+export const _testHelpers = { generateToken };

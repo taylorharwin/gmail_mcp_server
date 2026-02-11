@@ -6,11 +6,13 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 config({ path: join(__dirname, "..", ".env") });
 
 import { randomUUID } from "node:crypto";
-import express, { type Request, type Response } from "express";
+import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { startAuthorization, handleOAuthCallback, exchangeAuthCode, refreshAccessToken, registerClient, authMiddleware } from "./auth.js";
+import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { GoogleCalendarOAuthProvider } from "./auth.js";
 import { registerTools, setSessionUser, clearSession } from "./tools.js";
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -54,147 +56,35 @@ app.use((req, res, next) => {
   next();
 });
 
-function htmlPage(title: string, body: string): string {
-  return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title></head><body style="font-family:sans-serif;max-width:480px;margin:2rem auto;padding:1.5rem;background:#eee;color:#111;"><h1 style="margin-top:0">${escapeHtml(title)}</h1>${body}</body></html>`;
-}
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
-
 // ---------------------------------------------------------------------------
-// Well-known metadata endpoints (RFC 9728, RFC 8414)
+// OAuth (SDK-provided routes + custom Google callback)
 // ---------------------------------------------------------------------------
 
-app.get("/.well-known/oauth-protected-resource", (_req, res) => {
-  res.json({
-    resource: BASE_URL,
-    authorization_servers: [BASE_URL],
-    bearer_methods_supported: ["header"],
-  });
+const provider = new GoogleCalendarOAuthProvider();
+
+app.use(mcpAuthRouter({
+  provider,
+  issuerUrl: new URL(BASE_URL),
+  baseUrl: new URL(BASE_URL),
+}));
+
+const bearerAuth = requireBearerAuth({
+  verifier: provider,
+  resourceMetadataUrl: `${BASE_URL}/.well-known/oauth-protected-resource`,
 });
-
-app.get("/.well-known/oauth-authorization-server", (_req, res) => {
-  res.json({
-    issuer: BASE_URL,
-    authorization_endpoint: `${BASE_URL}/authorize`,
-    token_endpoint: `${BASE_URL}/token`,
-    registration_endpoint: `${BASE_URL}/register`,
-    response_types_supported: ["code"],
-    grant_types_supported: ["authorization_code", "refresh_token"],
-    code_challenge_methods_supported: ["S256"],
-    token_endpoint_auth_methods_supported: ["none"],
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Dynamic Client Registration (RFC 7591)
-// ---------------------------------------------------------------------------
-
-app.post("/register", (req, res) => {
-  const { client_name, redirect_uris, grant_types, response_types, token_endpoint_auth_method } = req.body;
-
-  if (!redirect_uris || !Array.isArray(redirect_uris) || redirect_uris.length === 0) {
-    res.status(400).json({ error: "invalid_client_metadata", error_description: "redirect_uris is required" });
-    return;
-  }
-
-  const client = registerClient({
-    clientName: client_name || "MCP Client",
-    redirectUris: redirect_uris,
-    grantTypes: grant_types,
-    responseTypes: response_types,
-    tokenEndpointAuthMethod: token_endpoint_auth_method,
-  });
-
-  res.status(201).json(client);
-});
-
-// ---------------------------------------------------------------------------
-// Home / health
-// ---------------------------------------------------------------------------
-
-app.get("/", (_req, res) => {
-  res.set("Content-Type", "text/html; charset=utf-8");
-  res.send(
-    htmlPage("Google Calendar MCP",
-      "<p>Server is running. Connect via an MCP client that supports OAuth 2.1.</p>" +
-      "<p>Metadata: <a href=\"/.well-known/oauth-authorization-server\">Authorization Server</a> &middot; " +
-      "<a href=\"/.well-known/oauth-protected-resource\">Protected Resource</a></p>")
-  );
-});
-
-app.get("/ping", (_req, res) => {
-  res.set("Content-Type", "text/plain").send("pong");
-});
-
-// ---------------------------------------------------------------------------
-// OAuth Authorization Endpoint
-// ---------------------------------------------------------------------------
-
-app.get("/authorize", (req, res) => {
-  const googleClientId = process.env.GOOGLE_CLIENT_ID;
-  if (!googleClientId) {
-    res.status(500).set("Content-Type", "text/html").send(
-      htmlPage("Error", '<p style="color:red">GOOGLE_CLIENT_ID is not set in .env</p>')
-    );
-    return;
-  }
-
-  const { response_type, client_id, redirect_uri, code_challenge, code_challenge_method, state } = req.query;
-
-  if (response_type !== "code" ||
-      !client_id || typeof client_id !== "string" ||
-      !redirect_uri || typeof redirect_uri !== "string" ||
-      !code_challenge || typeof code_challenge !== "string" ||
-      !state || typeof state !== "string") {
-    res.status(400).set("Content-Type", "text/html").send(
-      htmlPage("Bad Request",
-        "<p>Missing or invalid OAuth parameters.</p>" +
-        "<p>Required: <code>response_type=code</code>, <code>client_id</code>, <code>redirect_uri</code>, <code>code_challenge</code>, <code>state</code></p>")
-    );
-    return;
-  }
-
-  const method = (typeof code_challenge_method === "string" ? code_challenge_method : "S256");
-  if (method !== "S256") {
-    res.status(400).set("Content-Type", "text/html").send(
-      htmlPage("Bad Request", "<p>Only <code>code_challenge_method=S256</code> is supported</p>")
-    );
-    return;
-  }
-
-  try {
-    const { googleAuthUrl } = startAuthorization({
-      clientId: client_id,
-      redirectUri: redirect_uri,
-      codeChallenge: code_challenge,
-      codeChallengeMethod: method,
-      state,
-      scope: (typeof req.query.scope === "string" ? req.query.scope : "google-calendar"),
-    });
-    res.redirect(302, googleAuthUrl);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    res.status(500).set("Content-Type", "text/html").send(
-      htmlPage("Error", `<p style="color:red">${escapeHtml(msg)}</p>`)
-    );
-  }
-});
-
-// ---------------------------------------------------------------------------
-// OAuth Callback (Google redirects here, we redirect to MCP client)
-// ---------------------------------------------------------------------------
 
 app.get("/callback", async (req, res) => {
   const { code, state } = req.query;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const secret = process.env.TOKEN_ENCRYPTION_KEY;
-  if (!code || typeof code !== "string" || !state || typeof state !== "string" || !clientSecret || !secret) {
-    res.status(400).send("Missing code, state, or server config");
+  if (!code || typeof code !== "string" || !state || typeof state !== "string") {
+    res.status(400).send("Missing code or state");
+    return;
+  }
+  if (!process.env.GOOGLE_CLIENT_SECRET || !process.env.TOKEN_ENCRYPTION_KEY) {
+    res.status(500).send("Server configuration error");
     return;
   }
   try {
-    const { redirectUrl } = await handleOAuthCallback(code, state, clientSecret, secret);
+    const redirectUrl = await provider.handleGoogleCallback(code, state);
     res.redirect(302, redirectUrl);
   } catch (e) {
     res.status(400).send("Auth failed: " + (e instanceof Error ? e.message : String(e)));
@@ -202,49 +92,19 @@ app.get("/callback", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// OAuth Token Endpoint
+// Health check
 // ---------------------------------------------------------------------------
 
-app.post("/token", (req, res) => {
-  const { grant_type } = req.body;
-
-  if (grant_type === "authorization_code") {
-    const { code, code_verifier, redirect_uri, client_id } = req.body;
-    if (!code || !code_verifier || !redirect_uri || !client_id) {
-      res.status(400).json({ error: "invalid_request", error_description: "Missing required parameters" });
-      return;
-    }
-    try {
-      const result = exchangeAuthCode({ code, codeVerifier: code_verifier, redirectUri: redirect_uri, clientId: client_id });
-      res.json(result);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      res.status(400).json({ error: "invalid_grant", error_description: msg });
-    }
-  } else if (grant_type === "refresh_token") {
-    const { refresh_token, client_id } = req.body;
-    if (!refresh_token || !client_id) {
-      res.status(400).json({ error: "invalid_request", error_description: "Missing required parameters" });
-      return;
-    }
-    try {
-      const result = refreshAccessToken({ refreshToken: refresh_token, clientId: client_id });
-      res.json(result);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      res.status(400).json({ error: "invalid_grant", error_description: msg });
-    }
-  } else {
-    res.status(400).json({ error: "unsupported_grant_type" });
-  }
+app.get("/ping", (_req, res) => {
+  res.set("Content-Type", "text/plain").send("pong");
 });
 
 // ---------------------------------------------------------------------------
 // MCP transport (protected)
 // ---------------------------------------------------------------------------
 
-app.post("/mcp", authMiddleware, async (req, res) => {
-  const r = req as Request & { userId: string };
+app.post("/mcp", bearerAuth, async (req, res) => {
+  const userId = req.auth!.extra!.userId as string;
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   let transport = sessionId ? transports[sessionId] : undefined;
 
@@ -256,7 +116,7 @@ app.post("/mcp", authMiddleware, async (req, res) => {
       onsessioninitialized: (sid: string) => {
         transports[sid] = transport!;
         servers[sid] = sessionServer;
-        setSessionUser(sid, r.userId);
+        setSessionUser(sid, userId);
       },
     });
     transport.onclose = () => {
@@ -284,7 +144,7 @@ app.post("/mcp", authMiddleware, async (req, res) => {
   await transport.handleRequest(req, res, req.body);
 });
 
-app.get("/mcp", authMiddleware, async (req, res) => {
+app.get("/mcp", bearerAuth, async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   const transport = sessionId ? transports[sessionId] : undefined;
   if (!transport) {
@@ -294,7 +154,7 @@ app.get("/mcp", authMiddleware, async (req, res) => {
   await transport.handleRequest(req, res);
 });
 
-app.delete("/mcp", authMiddleware, async (req, res) => {
+app.delete("/mcp", bearerAuth, async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   const transport = sessionId ? transports[sessionId] : undefined;
   if (!transport) {
