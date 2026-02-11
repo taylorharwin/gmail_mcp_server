@@ -29,64 +29,108 @@ async function calendarFor(extra: { sessionId?: string }): Promise<CalendarClien
 }
 
 export function registerTools(server: McpServer): void {
-  server.tool(
+  server.registerTool(
     "list_calendars",
-    "List calendars the user can access",
-    { minAccessRole: z.string().optional().describe("Optional filter by min access role") },
+    {
+      description: "List calendars the user can access",
+      inputSchema: {
+        minAccessRole: z.string().optional().describe("Optional filter by min access role"),
+      },
+      outputSchema: {
+        items: z.array(z.object({
+          id: z.string(),
+          summary: z.string(),
+          primary: z.boolean().optional(),
+          accessRole: z.string(),
+        })),
+      },
+    },
     async (args, extra) => {
       const client = await calendarFor(extra);
       const items = await listCalendars(client, args.minAccessRole);
-      return { content: [{ type: "text" as const, text: JSON.stringify({ items }, null, 2) }] };
+      return { content: [], structuredContent: { items } };
     }
   );
 
-  server.tool(
+  server.registerTool(
     "list_events",
-    "List events in a calendar",
     {
-      calendarId: z.string().describe("Calendar ID (e.g. primary)"),
-      timeMin: z.string().describe("ISO datetime min"),
-      timeMax: z.string().describe("ISO datetime max"),
-      maxResults: z.number().default(50),
-      q: z.string().optional(),
+      description: "List events in a calendar",
+      inputSchema: {
+        calendarId: z.string().describe("Calendar ID (e.g. primary)"),
+        timeMin: z.string().describe("ISO datetime min"),
+        timeMax: z.string().describe("ISO datetime max"),
+        maxResults: z.number().default(50),
+        q: z.string().optional(),
+      },
+      outputSchema: {
+        items: z.array(z.object({
+          id: z.string(),
+          summary: z.string(),
+          start: z.string(),
+          end: z.string(),
+          status: z.string(),
+          htmlLink: z.string(),
+        })),
+      },
     },
     async (args, extra) => {
       const client = await calendarFor(extra);
       const items = await listEvents(client, args.calendarId, args.timeMin, args.timeMax, args.maxResults, args.q);
-      return { content: [{ type: "text" as const, text: JSON.stringify({ items }, null, 2) }] };
+      return { content: [], structuredContent: { items } };
     }
   );
 
-  server.tool(
+  server.registerTool(
     "list_acl",
-    "List access control rules for a calendar (who has access and their role)",
     {
-      calendarId: z.string().describe("Calendar ID (e.g. primary)"),
+      description: "List access control rules for a calendar (who has access and their role)",
+      inputSchema: {
+        calendarId: z.string().describe("Calendar ID (e.g. primary)"),
+      },
+      outputSchema: {
+        items: z.array(z.object({
+          id: z.string(),
+          scope: z.object({
+            type: z.string(),
+            value: z.string(),
+          }),
+          role: z.string(),
+        })),
+      },
     },
     async (args, extra) => {
       const client = await calendarFor(extra);
       const items = await listAcl(client, args.calendarId);
-      return { content: [{ type: "text" as const, text: JSON.stringify({ items }, null, 2) }] };
+      return { content: [], structuredContent: { items } };
     }
   );
 
-  server.tool(
+  server.registerTool(
     "create_event",
-    "Create a calendar event",
     {
-      calendarId: z.string(),
-      summary: z.string(),
-      start: z.string().describe("ISO datetime"),
-      end: z.string().describe("ISO datetime"),
-      description: z.string().optional(),
-      attendees: z.array(z.string()).optional(),
+      description: "Create a calendar event",
+      inputSchema: {
+        calendarId: z.string(),
+        summary: z.string(),
+        start: z.string().describe("ISO datetime"),
+        end: z.string().describe("ISO datetime"),
+        description: z.string().optional(),
+        attendees: z.array(z.string()).optional(),
+      },
+      outputSchema: {
+        id: z.string(),
+        htmlLink: z.string(),
+        start: z.string(),
+        end: z.string(),
+      },
     },
     async (args, extra) => {
       const client = await calendarFor(extra);
       const event = await createEvent(
         client, args.calendarId, args.summary, args.start, args.end, args.description, args.attendees
       );
-      return { content: [{ type: "text" as const, text: JSON.stringify(event, null, 2) }] };
+      return { content: [], structuredContent: event };
     }
   );
 }
