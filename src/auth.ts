@@ -89,7 +89,11 @@ export class GoogleCalendarOAuthProvider implements OAuthServerProvider {
   get clientsStore(): OAuthRegisteredClientsStore {
     const clients = this._clients;
     return {
-      getClient: (clientId: string) => clients.get(clientId),
+      getClient: (clientId: string) => {
+        const found = clients.get(clientId);
+        console.log(`[auth] getClient clientId=${clientId} found=${!!found}`);
+        return found;
+      },
       registerClient: (client: Omit<OAuthClientInformationFull, "client_id" | "client_id_issued_at">) => {
         const clientId = generateToken();
         const full = {
@@ -98,6 +102,7 @@ export class GoogleCalendarOAuthProvider implements OAuthServerProvider {
           client_id_issued_at: Math.floor(Date.now() / 1000),
         } as OAuthClientInformationFull;
         clients.set(clientId, full);
+        console.log(`[auth] registerClient clientId=${clientId}`);
         return full;
       },
     };
@@ -111,6 +116,8 @@ export class GoogleCalendarOAuthProvider implements OAuthServerProvider {
     res: Response,
   ): Promise<void> {
     this._cleanupExpired();
+
+    console.log(`[auth] authorize called for clientId=${client.client_id} redirectUri=${params.redirectUri}`);
 
     const googleState = generateToken();
     const googleCodeVerifier = b64url(randomBytes(32));
@@ -126,20 +133,27 @@ export class GoogleCalendarOAuthProvider implements OAuthServerProvider {
       createdAt: Date.now(),
     });
 
+    console.log(`[auth] stored pending auth with googleState=${googleState}`);
+
     const baseUrl = process.env.BASE_URL || "http://localhost:3000";
     const googleClientId = process.env.GOOGLE_CLIENT_ID!;
     const googleAuthUrl = getAuthUrl(googleClientId, `${baseUrl}/callback`, googleState, googleCodeVerifier);
+    console.log(`[auth] redirecting to Google consent screen`);
     res.redirect(302, googleAuthUrl);
   }
 
   // --- Google callback (not part of OAuthServerProvider interface) ---
 
   async handleGoogleCallback(googleCode: string, googleState: string): Promise<string> {
+    console.log(`[auth] handleGoogleCallback googleState=${googleState}`);
+
     const pending = this._pendingAuths.get(googleState);
     this._pendingAuths.delete(googleState);
 
     if (!pending) throw new Error("Invalid or expired state");
     if (Date.now() - pending.createdAt > PENDING_AUTH_TTL) throw new Error("Authorization request expired");
+
+    console.log(`[auth] found pending auth for clientId=${pending.mcpClientId}, exchanging Google code for tokens`);
 
     const baseUrl = process.env.BASE_URL || "http://localhost:3000";
     const googleClientId = process.env.GOOGLE_CLIENT_ID!;
@@ -149,6 +163,8 @@ export class GoogleCalendarOAuthProvider implements OAuthServerProvider {
     const tokens = await exchangeCode(googleClientId, clientSecret, `${baseUrl}/callback`, googleCode, pending.googleCodeVerifier);
     const userId = generateToken();
     saveTokens(userId, tokens, secret);
+
+    console.log(`[auth] Google tokens saved for userId=${userId}`);
 
     const code = generateToken();
     this._authCodes.set(code, {
@@ -164,6 +180,7 @@ export class GoogleCalendarOAuthProvider implements OAuthServerProvider {
     const redirectUrl = new URL(pending.mcpRedirectUri);
     redirectUrl.searchParams.set("code", code);
     redirectUrl.searchParams.set("state", pending.mcpState);
+    console.log(`[auth] issued MCP auth code, redirecting back to MCP client at ${pending.mcpRedirectUri}`);
     return redirectUrl.toString();
   }
 
@@ -173,6 +190,7 @@ export class GoogleCalendarOAuthProvider implements OAuthServerProvider {
     _client: OAuthClientInformationFull,
     authorizationCode: string,
   ): Promise<string> {
+    console.log(`[auth] challengeForAuthorizationCode — looking up PKCE challenge`);
     const entry = this._authCodes.get(authorizationCode);
     if (!entry) throw new Error("Invalid authorization code");
     return entry.mcpCodeChallenge;
@@ -189,10 +207,13 @@ export class GoogleCalendarOAuthProvider implements OAuthServerProvider {
   ): Promise<OAuthTokens> {
     this._cleanupExpired();
 
+    console.log(`[auth] exchangeAuthorizationCode for clientId=${client.client_id}`);
+
     const entry = this._authCodes.get(authorizationCode);
     if (!entry) throw new Error("Invalid authorization code");
 
     if (entry.used) {
+      console.log(`[auth] auth code reuse detected — revoking tokens for userId=${entry.userId}`);
       this._revokeTokensForUser(entry.userId, entry.mcpClientId);
       this._authCodes.delete(authorizationCode);
       throw new Error("Authorization code already used");
@@ -201,6 +222,7 @@ export class GoogleCalendarOAuthProvider implements OAuthServerProvider {
     entry.used = true;
 
     if (Date.now() - entry.createdAt > AUTH_CODE_TTL) {
+      console.log(`[auth] auth code expired`);
       this._authCodes.delete(authorizationCode);
       throw new Error("Authorization code expired");
     }
@@ -231,6 +253,8 @@ export class GoogleCalendarOAuthProvider implements OAuthServerProvider {
       mcpClientId: entry.mcpClientId,
     });
 
+    console.log(`[auth] issued access token (expires in ${accessTokenTtlSeconds()}s) and refresh token for userId=${entry.userId}`);
+
     return {
       access_token: accessToken,
       token_type: "Bearer",
@@ -245,6 +269,8 @@ export class GoogleCalendarOAuthProvider implements OAuthServerProvider {
     _scopes?: string[],
     _resource?: URL,
   ): Promise<OAuthTokens> {
+    console.log(`[auth] exchangeRefreshToken for clientId=${client.client_id}`);
+
     const entry = this._refreshTokens.get(refreshToken);
     if (!entry) throw new Error("Invalid refresh token");
 
@@ -260,6 +286,8 @@ export class GoogleCalendarOAuthProvider implements OAuthServerProvider {
       expiresAt: Date.now() + accessTokenTtl(),
     });
 
+    console.log(`[auth] refreshed — new access token issued for userId=${entry.userId}`);
+
     return {
       access_token: accessToken,
       token_type: "Bearer",
@@ -271,12 +299,18 @@ export class GoogleCalendarOAuthProvider implements OAuthServerProvider {
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     const entry = this._accessTokens.get(token);
-    if (!entry) throw new Error("Invalid access token");
+    if (!entry) {
+      console.log(`[auth] verifyAccessToken — invalid token`);
+      throw new Error("Invalid access token");
+    }
 
     if (Date.now() > entry.expiresAt) {
+      console.log(`[auth] verifyAccessToken — token expired for userId=${entry.userId}`);
       this._accessTokens.delete(token);
       throw new Error("Access token expired");
     }
+
+    console.log(`[auth] verifyAccessToken — valid, userId=${entry.userId} clientId=${entry.mcpClientId}`);
 
     return {
       token,

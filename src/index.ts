@@ -43,19 +43,6 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-// CORS — required by MCP spec for browser-based clients
-app.use((req, res, next) => {
-  res.set("Access-Control-Allow-Origin", "*");
-  res.set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization, mcp-session-id");
-  res.set("Access-Control-Expose-Headers", "mcp-session-id");
-  if (req.method === "OPTIONS") {
-    res.status(204).end();
-    return;
-  }
-  next();
-});
-
 // ---------------------------------------------------------------------------
 // OAuth (SDK-provided routes + custom Google callback)
 // ---------------------------------------------------------------------------
