@@ -6,14 +6,14 @@ const SCOPES = ["https://www.googleapis.com/auth/calendar.events", "https://www.
 
 export function getAuthUrl(clientId: string, redirectUri: string, state: string, codeVerifier: string): string {
   const oauth2 = new google.auth.OAuth2(clientId, undefined, redirectUri);
-  const codeChallenge = Buffer.from(createHash("sha256").update(codeVerifier).digest("base64url"));
+  const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
   return oauth2.generateAuthUrl({
     access_type: "offline",
     scope: SCOPES,
     prompt: "consent",
     state,
     code_challenge: codeChallenge,
-    code_challenge_method: "S256",
+    code_challenge_method: "S256" as import("google-auth-library").CodeChallengeMethod,
   });
 }
 
