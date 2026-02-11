@@ -10,7 +10,7 @@ import express, { type Request, type Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { startAuthorization, handleOAuthCallback, exchangeAuthCode, refreshAccessToken, authMiddleware } from "./auth.js";
+import { startAuthorization, handleOAuthCallback, exchangeAuthCode, refreshAccessToken, registerClient, authMiddleware } from "./auth.js";
 import { registerTools, setSessionUser, clearSession } from "./tools.js";
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -41,6 +41,19 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
+// CORS — required by MCP spec for browser-based clients
+app.use((req, res, next) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization, mcp-session-id");
+  res.set("Access-Control-Expose-Headers", "mcp-session-id");
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
+  next();
+});
+
 function htmlPage(title: string, body: string): string {
   return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title></head><body style="font-family:sans-serif;max-width:480px;margin:2rem auto;padding:1.5rem;background:#eee;color:#111;"><h1 style="margin-top:0">${escapeHtml(title)}</h1>${body}</body></html>`;
 }
@@ -65,11 +78,35 @@ app.get("/.well-known/oauth-authorization-server", (_req, res) => {
     issuer: BASE_URL,
     authorization_endpoint: `${BASE_URL}/authorize`,
     token_endpoint: `${BASE_URL}/token`,
+    registration_endpoint: `${BASE_URL}/register`,
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
   });
+});
+
+// ---------------------------------------------------------------------------
+// Dynamic Client Registration (RFC 7591)
+// ---------------------------------------------------------------------------
+
+app.post("/register", (req, res) => {
+  const { client_name, redirect_uris, grant_types, response_types, token_endpoint_auth_method } = req.body;
+
+  if (!redirect_uris || !Array.isArray(redirect_uris) || redirect_uris.length === 0) {
+    res.status(400).json({ error: "invalid_client_metadata", error_description: "redirect_uris is required" });
+    return;
+  }
+
+  const client = registerClient({
+    clientName: client_name || "MCP Client",
+    redirectUris: redirect_uris,
+    grantTypes: grant_types,
+    responseTypes: response_types,
+    tokenEndpointAuthMethod: token_endpoint_auth_method,
+  });
+
+  res.status(201).json(client);
 });
 
 // ---------------------------------------------------------------------------

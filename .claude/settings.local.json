@@ -1,0 +1,11 @@
+{
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "google-calendar"
+  ],
+  "permissions": {
+    "allow": [
+      "mcp__google-calendar__list_events"
+    ]
+  }
+}

@@ -61,10 +61,20 @@ interface IssuedRefreshToken {
   mcpClientId: string;
 }
 
+interface RegisteredClient {
+  client_id: string;
+  client_name: string;
+  redirect_uris: string[];
+  grant_types: string[];
+  response_types: string[];
+  token_endpoint_auth_method: string;
+}
+
 // ---------------------------------------------------------------------------
 // In-memory stores
 // ---------------------------------------------------------------------------
 
+const registeredClients = new Map<string, RegisteredClient>();
 const pendingAuthorizations = new Map<string, PendingAuthorization>();
 const authCodes = new Map<string, IssuedAuthCode>();
 const accessTokens = new Map<string, IssuedAccessToken>();
@@ -106,6 +116,30 @@ function revokeTokensForUser(userId: string, mcpClientId: string): void {
   for (const [key, val] of refreshTokens) {
     if (val.userId === userId && val.mcpClientId === mcpClientId) refreshTokens.delete(key);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic Client Registration (RFC 7591)
+// ---------------------------------------------------------------------------
+
+export function registerClient(params: {
+  clientName: string;
+  redirectUris: string[];
+  grantTypes?: string[];
+  responseTypes?: string[];
+  tokenEndpointAuthMethod?: string;
+}): RegisteredClient {
+  const clientId = generateToken();
+  const client: RegisteredClient = {
+    client_id: clientId,
+    client_name: params.clientName,
+    redirect_uris: params.redirectUris,
+    grant_types: params.grantTypes ?? ["authorization_code"],
+    response_types: params.responseTypes ?? ["code"],
+    token_endpoint_auth_method: params.tokenEndpointAuthMethod ?? "none",
+  };
+  registeredClients.set(clientId, client);
+  return client;
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +344,7 @@ export function authMiddleware(req: Request, res: Response, next: () => void): v
 // ---------------------------------------------------------------------------
 
 export const _testHelpers = {
+  registeredClients,
   pendingAuthorizations,
   authCodes,
   accessTokens,
